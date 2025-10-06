@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/gofrs/uuid"
 	"github.com/sirupsen/logrus"
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/oauthserver"
+	"github.com/supabase/auth/internal/api/shared"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
 	"github.com/supabase/auth/internal/security"
@@ -82,9 +85,9 @@ func (a *API) limitHandler(lmt *limiter.Limiter) middlewareHandler {
 	}
 }
 
-// oauthClientAuth optionally authenticates an OAuth client as middleware
-// This doesn't fail if no client credentials are provided, but validates them if present
-func (a *API) oauthClientAuth(w http.ResponseWriter, r *http.Request) (context.Context, error) {
+// requireOAuthClientAuth authenticates an OAuth client as middleware
+// Requires client_id to be present and validates client credentials
+func (a *API) requireOAuthClientAuth(w http.ResponseWriter, r *http.Request) (context.Context, error) {
 	ctx := r.Context()
 
 	clientID, clientSecret, err := oauthserver.ExtractClientCredentials(r)
@@ -97,9 +100,15 @@ func (a *API) oauthClientAuth(w http.ResponseWriter, r *http.Request) (context.C
 		return ctx, nil
 	}
 
+	// Parse client_id as UUID
+	clientUUID, err := uuid.FromString(clientID)
+	if err != nil {
+		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "Invalid client_id format")
+	}
+
 	// Validate client credentials
 	db := a.db.WithContext(ctx)
-	client, err := models.FindOAuthServerClientByClientID(db, clientID)
+	client, err := models.FindOAuthServerClientByID(db, clientUUID)
 	if err != nil {
 		if models.IsNotFoundError(err) {
 			return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "Invalid client credentials")
@@ -107,13 +116,13 @@ func (a *API) oauthClientAuth(w http.ResponseWriter, r *http.Request) (context.C
 		return nil, apierrors.NewInternalServerError("Error validating client credentials").WithInternalError(err)
 	}
 
-	// Validate client secret
-	if !oauthserver.ValidateClientSecret(clientSecret, client.ClientSecretHash) {
-		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "Invalid client credentials")
+	// Validate authentication using centralized logic
+	if err := oauthserver.ValidateClientAuthentication(client, clientSecret); err != nil {
+		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, err.Error())
 	}
 
 	// Add authenticated client to context
-	ctx = oauthserver.WithOAuthServerClient(ctx, client)
+	ctx = shared.WithOAuthServerClient(ctx, client)
 	return ctx, nil
 }
 
@@ -214,18 +223,12 @@ func (a *API) isValidExternalHost(w http.ResponseWriter, req *http.Request) (con
 		protocol := "https"
 
 		if xForwardedHost != "" {
-			for _, host := range config.Mailer.ExternalHosts {
-				if host == xForwardedHost {
-					hostname = host
-					break
-				}
+			if slices.Contains(config.Mailer.ExternalHosts, xForwardedHost) {
+				hostname = xForwardedHost
 			}
 		} else if reqHost != "" {
-			for _, host := range config.Mailer.ExternalHosts {
-				if host == reqHost {
-					hostname = host
-					break
-				}
+			if slices.Contains(config.Mailer.ExternalHosts, reqHost) {
+				hostname = reqHost
 			}
 		}
 
@@ -291,6 +294,51 @@ func (a *API) requireSAMLEnabled(w http.ResponseWriter, req *http.Request) (cont
 		return nil, apierrors.NewNotFoundError(apierrors.ErrorCodeSAMLProviderDisabled, "SAML 2.0 is disabled")
 	}
 	return ctx, nil
+}
+
+// requireSCIMEnabled ensures SCIM is enabled
+func (a *API) requireSCIMEnabled(w http.ResponseWriter, req *http.Request) (context.Context, error) {
+	ctx := req.Context()
+	if !a.config.SCIM.Enabled {
+		return nil, apierrors.NewNotFoundError(apierrors.ErrorCodeValidationFailed, "SCIM is disabled")
+	}
+	return ctx, nil
+}
+
+const scimProviderContextKey = contextKey("scim_provider_id")
+
+func withSCIMProvider(ctx context.Context, providerID string) context.Context {
+	return context.WithValue(ctx, scimProviderContextKey, providerID)
+}
+
+func getSCIMProvider(ctx context.Context) string {
+	if val := ctx.Value(scimProviderContextKey); val != nil {
+		if providerID, ok := val.(string); ok {
+			return providerID
+		}
+	}
+	return ""
+}
+
+// requireSCIMAuth authenticates SCIM requests via Bearer token from scim_providers table
+func (a *API) requireSCIMAuth(w http.ResponseWriter, req *http.Request) (context.Context, error) {
+	ctx := req.Context()
+	db := a.db.WithContext(ctx)
+
+	// Extract Bearer token
+	authz := req.Header.Get("Authorization")
+	if m := bearerRegexp.FindStringSubmatch(authz); len(m) == 2 {
+		token := m[1]
+
+		// Look up provider by token in database
+		provider, err := models.FindSCIMProviderByToken(db, token)
+		if err == nil && provider != nil {
+			// Use provider UUID as the stable provider ID
+			return withSCIMProvider(ctx, provider.ID.String()), nil
+		}
+	}
+
+	return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeInvalidCredentials, "Invalid SCIM credentials")
 }
 
 func (a *API) requireManualLinkingEnabled(w http.ResponseWriter, req *http.Request) (context.Context, error) {

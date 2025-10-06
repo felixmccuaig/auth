@@ -64,11 +64,13 @@ type User struct {
 	Factors    []Factor   `json:"factors,omitempty" has_many:"factors"`
 	Identities []Identity `json:"identities" has_many:"identities"`
 
-	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at" db:"updated_at"`
-	BannedUntil *time.Time `json:"banned_until,omitempty" db:"banned_until"`
-	DeletedAt   *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
-	IsAnonymous bool       `json:"is_anonymous" db:"is_anonymous"`
+	CreatedAt      time.Time          `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at" db:"updated_at"`
+	BannedUntil    *time.Time         `json:"banned_until,omitempty" db:"banned_until"`
+	DeletedAt      *time.Time         `json:"deleted_at,omitempty" db:"deleted_at"`
+	IsAnonymous    bool               `json:"is_anonymous" db:"is_anonymous"`
+	SCIMExternalID storage.NullString `json:"scim_external_id,omitempty" db:"scim_external_id"`
+	SCIMProviderID storage.NullString `json:"scim_provider_id,omitempty" db:"scim_provider_id"`
 
 	DONTUSEINSTANCEID uuid.UUID `json:"-" db:"instance_id"`
 }
@@ -716,9 +718,11 @@ func FindUsersInAudience(tx *storage.Connection, aud string, pageParams *Paginat
 	return users, err
 }
 
-// IsDuplicatedEmail returns whether a user exists with a matching email and audience.
+// IsDuplicatedEmail returns whether a user exists with a matching email and
+// audience importantly in the *default* identity linking domain (meaning SSO
+// accounts and similar are not considered).
 // If a currentUser is provided, we will need to filter out any identities that belong to the current user.
-func IsDuplicatedEmail(tx *storage.Connection, email, aud string, currentUser *User) (*User, error) {
+func IsDuplicatedEmail(tx *storage.Connection, email, aud string, currentUser *User, ownDomainProviders []string) (*User, error) {
 	var identities []Identity
 
 	if err := tx.Eager().Q().Where("email = ?", strings.ToLower(email)).All(&identities); err != nil {
@@ -732,7 +736,7 @@ func IsDuplicatedEmail(tx *storage.Connection, email, aud string, currentUser *U
 	userIDs := make(map[string]uuid.UUID)
 	for _, identity := range identities {
 		if _, ok := userIDs[identity.UserID.String()]; !ok {
-			if !identity.IsForSSOProvider() {
+			if GetAccountLinkingDomain(identity.Provider, ownDomainProviders) == "default" {
 				userIDs[identity.UserID.String()] = identity.UserID
 			}
 		}
